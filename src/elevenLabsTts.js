@@ -36,21 +36,36 @@ export async function elevenLabsTextToSpeech({
     },
   };
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "xi-api-key": ELEVEN_API_KEY,
-      "Content-Type": "application/json",
-      Accept: "audio/mpeg",
-    },
-    body: JSON.stringify(body),
-  });
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVEN_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg",
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    const wrapped = new Error(`ElevenLabs fetch failed: ${err?.message ?? String(err)}`);
+    wrapped.cause = err;
+    throw wrapped;
+  }
 
   if (!res.ok) {
     const errText = await res.text().catch(() => "");
     throw new Error(`ElevenLabs TTS failed (${res.status}): ${errText}`);
   }
 
-  const arrayBuf = await res.arrayBuffer();
+  let arrayBuf;
+  try {
+    arrayBuf = await res.arrayBuffer();
+  } catch (err) {
+    const wrapped = new Error(`ElevenLabs response body read failed: ${err?.message ?? String(err)}`);
+    wrapped.cause = err;
+    throw wrapped;
+  }
+
   return Buffer.from(arrayBuf);
 }

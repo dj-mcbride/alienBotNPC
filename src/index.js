@@ -1,7 +1,10 @@
-// /src/index.js
-
 import "dotenv/config";
-import { Client, GatewayIntentBits } from "discord.js";
+import {
+  Client,
+  GatewayIntentBits,
+  PermissionFlagsBits,
+  ChannelType,
+} from "discord.js";
 import OpenAI from "openai";
 
 import { elevenLabsTextToSpeech } from "./elevenLabsTts.js";
@@ -21,63 +24,17 @@ import {
 /**
  * @fileoverview
  * Discord NPC chatbot entrypoint.
- *
- * Responsibilities:
- * - Connect to Discord and listen for messages in mapped channels.
- * - Route each message to the appropriate NPC persona (system prompt).
- * - Persist conversation history to MongoDB (per channel).
- * - Call OpenAI Responses API with trimmed history to generate replies.
- * - Optionally synthesize and play TTS in the user's voice channel (ElevenLabs).
- *
- * Notes:
- * - Mongo stores the full conversation; we only retrieve the last N turns for inference.
- * - TTS can be globally disabled via env var / CLI flag to save credits.
  */
 
 // -----------------------------
 // Config
 // -----------------------------
 
-/**
- * Keep only the last N turns *in the model prompt* so token usage stays sane.
- * Mongo can store more than N — we just only retrieve N for inference.
- * @type {number}
- */
 const MAX_TURNS = 16;
-
-/**
- * OpenAI model used for NPC replies.
- * @type {string}
- */
 const OPENAI_MODEL = "gpt-4o-mini";
-
-/**
- * Max tokens for the assistant response.
- * @type {number}
- */
 const MAX_OUTPUT_TOKENS = 250;
-
-/**
- * How long to stay connected after playing TTS audio.
- * @type {number}
- */
 const DISCONNECT_AFTER_MS = 12_000;
 
-/**
- * Global toggle to enable/disable all voice output (TTS).
- *
- * Priority (highest to lowest):
- * 1) CLI flag: --no-tts / --tts
- * 2) Env var: DISCORD_TTS_ENABLED ("true"/"false"/"1"/"0")
- * 3) Default: enabled
- *
- * Examples:
- * - Disable voice:  node src/index.js --no-tts
- * - Enable voice:   node src/index.js --tts
- * - Disable voice:  DISCORD_TTS_ENABLED=false node src/index.js
- *
- * @type {boolean}
- */
 const TTS_ENABLED = resolveTtsEnabled({
   argv: process.argv.slice(2),
   envValue: process.env.DISCORD_TTS_ENABLED,
@@ -88,10 +45,6 @@ const TTS_ENABLED = resolveTtsEnabled({
 // Clients
 // -----------------------------
 
-/**
- * Discord client instance.
- * @type {Client<boolean>}
- */
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -101,44 +54,58 @@ const client = new Client({
   ],
 });
 
-/**
- * OpenAI API client instance.
- * @type {OpenAI}
- */
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // -----------------------------
 // Logging
 // -----------------------------
 
-/**
- * Minimal structured logger for grep-friendly logs in production.
- *
- * @param {string} type - Event type identifier (e.g., "openai.request").
- * @param {Record<string, any>} payload - Additional event metadata.
- * @returns {void}
- */
 function logEvent(type, payload) {
   const ts = new Date().toISOString();
-  // Keep the log format stable for downstream parsing.
   console.log(`[${ts}] ${type}`, payload);
+}
+
+// -----------------------------
+// Voice debug state
+// -----------------------------
+
+/**
+ * Tracks active voice-join attempts so we only log the relevant
+ * voice gateway events while a TTS attempt is in flight.
+ *
+ * key: guildId
+ * value: {
+ *   guildId: string,
+ *   channelId: string,
+ *   channelName: string | null,
+ *   npcName: string | null,
+ *   startedAt: string
+ * }
+ */
+const pendingVoiceDebugByGuild = new Map();
+
+function beginPendingVoiceDebug({ guildId, channelId, channelName, npcName }) {
+  pendingVoiceDebugByGuild.set(guildId, {
+    guildId,
+    channelId,
+    channelName: channelName ?? null,
+    npcName: npcName ?? null,
+    startedAt: new Date().toISOString(),
+  });
+}
+
+function endPendingVoiceDebug(guildId) {
+  pendingVoiceDebugByGuild.delete(guildId);
+}
+
+function getPendingVoiceDebug(guildId) {
+  return pendingVoiceDebugByGuild.get(guildId) ?? null;
 }
 
 // -----------------------------
 // Helpers
 // -----------------------------
 
-/**
- * Parse a truthy/falsey environment value.
- *
- * Accepted truthy: "true", "1", "yes", "y", "on"
- * Accepted falsey: "false", "0", "no", "n", "off"
- *
- * Any other value returns undefined.
- *
- * @param {string | undefined} value
- * @returns {boolean | undefined}
- */
 function parseBool(value) {
   if (value == null) return undefined;
   const v = String(value).trim().toLowerCase();
@@ -149,39 +116,16 @@ function parseBool(value) {
   return undefined;
 }
 
-/**
- * Resolve whether TTS is enabled using CLI args and env var.
- *
- * CLI flags:
- * - --no-tts : disables voice
- * - --tts    : enables voice
- *
- * @param {{
- *   argv: string[],
- *   envValue: string | undefined,
- *   defaultValue: boolean
- * }} params
- * @returns {boolean}
- */
 function resolveTtsEnabled({ argv, envValue, defaultValue }) {
-  // CLI flags override everything
   if (argv.includes("--no-tts")) return false;
   if (argv.includes("--tts")) return true;
 
-  // Env var next
   const envParsed = parseBool(envValue);
   if (typeof envParsed === "boolean") return envParsed;
 
-  // Default
   return defaultValue;
 }
 
-/**
- * Resolve an NPC config for a Discord channel, with structured error reporting.
- *
- * @param {string} discordChannelId
- * @returns {{ npcKey: string | null, npc: any | null, error?: string }}
- */
 function resolveNpcForChannel(discordChannelId) {
   const npcKey = DISCORD_CHANNEL_TO_NPC_KEY[discordChannelId] ?? null;
   if (!npcKey) return { npcKey: null, npc: null, error: "channel_not_mapped" };
@@ -192,33 +136,10 @@ function resolveNpcForChannel(discordChannelId) {
   return { npcKey, npc };
 }
 
-/**
- * Persist a single chat turn to Mongo.
- *
- * @param {{
- *   channelId: string,
- *   role: "user" | "assistant",
- *   content: string,
- *   npcKey: string,
- *   authorTag: string,
- *   discordMessageId: string | null,
- *   ts: Date
- * }} entry
- * @returns {Promise<void>}
- */
 async function persistTurn(entry) {
   await appendHistory(entry);
 }
 
-/**
- * Generate an NPC reply using OpenAI Responses API.
- *
- * @param {{
- *   npcSystem: string,
- *   history: Array<{ role: "user" | "assistant", content: string }>,
- * }} params
- * @returns {Promise<{ replyText: string, usage: any }>}
- */
 async function generateNpcReply({ npcSystem, history }) {
   const response = await openai.responses.create({
     model: OPENAI_MODEL,
@@ -234,18 +155,45 @@ async function generateNpcReply({ npcSystem, history }) {
   return { replyText, usage: response.usage ?? null };
 }
 
+function getChannelTypeName(channel) {
+  if (!channel) return null;
+
+  switch (channel.type) {
+    case ChannelType.GuildVoice:
+      return "GuildVoice";
+    case ChannelType.GuildStageVoice:
+      return "GuildStageVoice";
+    case ChannelType.GuildText:
+      return "GuildText";
+    case ChannelType.GuildCategory:
+      return "GuildCategory";
+    default:
+      return `Unknown(${channel.type})`;
+  }
+}
+
+function getBotVoiceChannelPermissions(guild, voiceChannel) {
+  const me = guild?.members?.me;
+  const perms = me ? voiceChannel?.permissionsFor(me) : null;
+
+  return {
+    botUserId: me?.id ?? null,
+    botTag: me?.user?.tag ?? null,
+    canViewChannel: perms?.has(PermissionFlagsBits.ViewChannel) ?? null,
+    canConnect: perms?.has(PermissionFlagsBits.Connect) ?? null,
+    canSpeak: perms?.has(PermissionFlagsBits.Speak) ?? null,
+    canUseVAD: perms?.has(PermissionFlagsBits.UseVAD) ?? null,
+    canMuteMembers: perms?.has(PermissionFlagsBits.MuteMembers) ?? null,
+    canMoveMembers: perms?.has(PermissionFlagsBits.MoveMembers) ?? null,
+    canRequestToSpeak: perms?.has(PermissionFlagsBits.RequestToSpeak) ?? null,
+  };
+}
+
 /**
  * Attempt TTS playback for an NPC reply if:
  * - Global TTS is enabled
  * - User is in a voice channel
  * - NPC has ElevenLabs voice configured
- *
- * @param {{
- *   message: import("discord.js").Message,
- *   npc: any,
- *   replyText: string,
- * }} params
- * @returns {Promise<void>}
  */
 async function maybeSpeakReply({ message, npc, replyText }) {
   if (!TTS_ENABLED) {
@@ -262,37 +210,108 @@ async function maybeSpeakReply({ message, npc, replyText }) {
 
   if (!canSpeak) return;
 
+  const guildId = message.guild?.id ?? null;
+
+  logEvent("voice.target.channel", {
+    guildId,
+    channelId: voiceChannel.id,
+    channelName: voiceChannel.name ?? null,
+    channelType: getChannelTypeName(voiceChannel),
+    parentId: voiceChannel.parentId ?? null,
+    parentName: voiceChannel.parent?.name ?? null,
+    memberCount: voiceChannel.members?.size ?? null,
+    userVoiceChannelId: message.member?.voice?.channelId ?? null,
+    npcName: npc.name,
+  });
+
+  logEvent("voice.target.permissions", {
+    guildId,
+    channelId: voiceChannel.id,
+    channelName: voiceChannel.name ?? null,
+    ...getBotVoiceChannelPermissions(message.guild, voiceChannel),
+  });
+
   logEvent("tts.request", {
     npcName: npc.name,
     voiceId: npc.voice.voiceId,
     channelId: voiceChannel.id,
   });
 
-  const mp3Buffer = await elevenLabsTextToSpeech({
-    text: replyText,
-    voiceId: npc.voice.voiceId,
-    settings: npc.voice.settings,
+  let mp3Buffer;
+  try {
+    mp3Buffer = await elevenLabsTextToSpeech({
+      text: replyText,
+      voiceId: npc.voice.voiceId,
+      settings: npc.voice.settings,
+    });
+  } catch (err) {
+    logEvent("tts.elevenlabs.error", {
+      npcName: npc.name,
+      voiceId: npc.voice.voiceId,
+      channelId: voiceChannel.id,
+      errorName: err?.name ?? null,
+      errorMessage: err?.message ?? String(err),
+      errorStack: err?.stack ?? null,
+      errorCause:
+        err?.cause instanceof Error
+          ? {
+              name: err.cause.name ?? null,
+              message: err.cause.message ?? null,
+              stack: err.cause.stack ?? null,
+            }
+          : (err?.cause ?? null),
+      errorCode: err?.code ?? null,
+    });
+    throw err;
+  }
+
+  beginPendingVoiceDebug({
+    guildId,
+    channelId: voiceChannel.id,
+    channelName: voiceChannel.name ?? null,
+    npcName: npc.name,
   });
 
-  await playMp3InVoiceChannel({
-    guild: message.guild,
-    voiceChannel,
-    mp3Buffer,
-    onLog: (type, payload) => logEvent(type, payload),
-    disconnectAfterMs: DISCONNECT_AFTER_MS,
-  });
+  try {
+    await playMp3InVoiceChannel({
+      guild: message.guild,
+      voiceChannel,
+      mp3Buffer,
+      onLog: (type, payload) => logEvent(type, payload),
+      disconnectAfterMs: DISCONNECT_AFTER_MS,
+    });
+  } catch (err) {
+    logEvent("tts.discord_voice.error", {
+      npcName: npc.name,
+      voiceId: npc.voice.voiceId,
+      channelId: voiceChannel.id,
+      guildId: message.guild?.id ?? null,
+      mp3Bytes: mp3Buffer?.length ?? null,
+      errorName: err?.name ?? null,
+      errorMessage: err?.message ?? String(err),
+      errorStack: err?.stack ?? null,
+      errorCause:
+        err?.cause instanceof Error
+          ? {
+              name: err.cause.name ?? null,
+              message: err.cause.message ?? null,
+              stack: err.cause.stack ?? null,
+            }
+          : (err?.cause ?? null),
+      errorCode: err?.code ?? null,
+    });
+    throw err;
+  } finally {
+    if (guildId) {
+      endPendingVoiceDebug(guildId);
+    }
+  }
 }
 
 // -----------------------------
 // Lifecycle
 // -----------------------------
 
-/**
- * Attach graceful shutdown handlers once at startup.
- * Ensures Mongo connection is closed on process termination.
- *
- * @returns {void}
- */
 function attachGracefulShutdown() {
   const shutdown = async (signal) => {
     try {
@@ -307,14 +326,6 @@ function attachGracefulShutdown() {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
-/**
- * Boot sequence:
- * - Initialize Mongo history connection
- * - Attach shutdown hooks
- * - Login to Discord
- *
- * @returns {Promise<void>}
- */
 async function boot() {
   await initMongoHistory();
   attachGracefulShutdown();
@@ -326,7 +337,6 @@ async function boot() {
     maxOutputTokens: MAX_OUTPUT_TOKENS,
   });
 
-  // Let discord.js surface login errors via rejection below.
   await client.login(process.env.DISCORD_TOKEN);
 }
 
@@ -339,7 +349,6 @@ client.on("messageCreate", async (message) => {
 
   const discordChannelId = message.channel.id;
 
-  // Log inbound message early for traceability, even if we ignore it.
   logEvent("discord.message.in", {
     channelId: discordChannelId,
     channelName: message.channel?.name,
@@ -363,7 +372,6 @@ client.on("messageCreate", async (message) => {
   logEvent("discord.message.routed", { npcKey, npcName: npc.name });
 
   try {
-    // 1) Persist user message
     await persistTurn({
       channelId: discordChannelId,
       role: "user",
@@ -374,10 +382,8 @@ client.on("messageCreate", async (message) => {
       ts: new Date(),
     });
 
-    // 2) Load last N turns for this channel (Mongo is source of truth)
     const channelHistory = await getRecentHistory(discordChannelId, MAX_TURNS);
 
-    // 3) Typing indicator while we call OpenAI
     await message.channel.sendTyping();
 
     logEvent("openai.request", {
@@ -387,7 +393,6 @@ client.on("messageCreate", async (message) => {
       lastUserMessage: message.content,
     });
 
-    // 4) Generate reply
     const { replyText, usage } = await generateNpcReply({
       npcSystem: npc.system,
       history: channelHistory,
@@ -399,7 +404,6 @@ client.on("messageCreate", async (message) => {
       usage,
     });
 
-    // 5) Persist assistant reply
     await persistTurn({
       channelId: discordChannelId,
       role: "assistant",
@@ -410,7 +414,6 @@ client.on("messageCreate", async (message) => {
       ts: new Date(),
     });
 
-    // 6) Send Discord reply
     logEvent("discord.message.out", {
       channelId: discordChannelId,
       npcName: npc.name,
@@ -419,28 +422,95 @@ client.on("messageCreate", async (message) => {
 
     await message.reply(replyText);
 
-    // 7) Best-effort TTS (never fail the message flow)
     try {
       await maybeSpeakReply({ message, npc, replyText });
     } catch (ttsErr) {
-      logEvent("tts.error", { npcName: npc.name, error: String(ttsErr) });
+      logEvent("tts.error", {
+        npcName: npc.name,
+        errorName: ttsErr?.name ?? null,
+        errorMessage: ttsErr?.message ?? String(ttsErr),
+        errorStack: ttsErr?.stack ?? null,
+        errorCause:
+          ttsErr?.cause instanceof Error
+            ? {
+                name: ttsErr.cause.name ?? null,
+                message: ttsErr.cause.message ?? null,
+                stack: ttsErr.cause.stack ?? null,
+              }
+            : (ttsErr?.cause ?? null),
+        errorCode: ttsErr?.code ?? null,
+      });
     }
   } catch (err) {
     console.error("[ERROR]", err);
     try {
       await message.reply("Something went wrong generating that response.");
     } catch {
-      // swallow — we don't want error handling to throw
+      // swallow
     }
   }
 });
 
-// Updated event name (fixes deprecation warning)
+/**
+ * Logs only bot voice state changes, and only while a TTS voice join
+ * is pending for that guild. This avoids noisy logging.
+ */
+client.on("voiceStateUpdate", (oldState, newState) => {
+  const botUserId = client.user?.id;
+  if (!botUserId) return;
+
+  const stateUserId = newState?.id ?? oldState?.id;
+  if (stateUserId !== botUserId) return;
+
+  const guildId = newState?.guild?.id ?? oldState?.guild?.id;
+  if (!guildId) return;
+
+  const pending = getPendingVoiceDebug(guildId);
+  if (!pending) return;
+
+  logEvent("discord.voiceStateUpdate.bot", {
+    guildId,
+    npcName: pending.npcName,
+    targetChannelId: pending.channelId,
+    targetChannelName: pending.channelName,
+    oldChannelId: oldState?.channelId ?? null,
+    newChannelId: newState?.channelId ?? null,
+    sessionId: newState?.sessionId ?? oldState?.sessionId ?? null,
+    selfMute: newState?.selfMute ?? null,
+    selfDeaf: newState?.selfDeaf ?? null,
+    serverMute: newState?.serverMute ?? null,
+    serverDeaf: newState?.serverDeaf ?? null,
+    suppress: newState?.suppress ?? null,
+  });
+});
+
+/**
+ * Logs VOICE_SERVER_UPDATE only while a TTS voice join
+ * is pending for that guild.
+ */
+client.on("raw", (packet) => {
+  if (packet?.t !== "VOICE_SERVER_UPDATE") return;
+
+  const guildId = packet?.d?.guild_id ?? null;
+  if (!guildId) return;
+
+  const pending = getPendingVoiceDebug(guildId);
+  if (!pending) return;
+
+  logEvent("discord.raw.voice_server_update", {
+    guildId,
+    npcName: pending.npcName,
+    targetChannelId: pending.channelId,
+    targetChannelName: pending.channelName,
+    endpoint: packet?.d?.endpoint ?? null,
+    tokenPresent: !!packet?.d?.token,
+  });
+});
+
 client.once("clientReady", () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
-// Start everything
 boot().catch((err) => {
   console.error("[BOOT ERROR]", err);
   process.exit(1);

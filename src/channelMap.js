@@ -1,7 +1,4 @@
-// channelMap.js
-
-// channelMap.js
-// Replace each "PASTE_CHANNEL_ID_HERE" with the actual Discord channel ID
+// /src/channelMap.js
 
 export const DISCORD_CHANNEL_TO_NPC_KEY = {
   // Leadership
@@ -14,6 +11,7 @@ export const DISCORD_CHANNEL_TO_NPC_KEY = {
   "1474957986974793768": "CHANNEL_ID_ORTEGA",            // npc-malik_ortega
   "1474958069271101615": "CHANNEL_ID_RINA",             // npc-rina_kovacs
   "1474958140167684208": "CHANNEL_ID_MARCUS",           // npc-marcus_vale
+  "1475255057065840722": "CHANNEL_ID_TAMSIN",         // npc-tasmin_rourke
 
   // Xenobiology / Research
   "1474957634275905616": "CHANNEL_ID_PAVEL",            // npc-dr_pavel_ionescu

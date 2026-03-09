@@ -13,15 +13,49 @@ import prism from "prism-media";
 import { Readable } from "node:stream";
 
 /**
- * Keep one connection/player per guild to avoid reconnect spam.
+ * Keep one connection/player per guild to avoid unnecessary player recreation.
+ * For debugging, we still force-destroy the voice connection before each join.
  */
 const voiceStateByGuild = new Map();
+const instrumentedConnections = new WeakSet();
+const instrumentedPlayers = new WeakSet();
 
-function getOrCreateGuildVoiceState(guildId) {
+function getOrCreateGuildVoiceState(guildId, onLog) {
   const existing = voiceStateByGuild.get(guildId);
   if (existing) return existing;
 
   const player = createAudioPlayer();
+
+  if (!instrumentedPlayers.has(player)) {
+    instrumentedPlayers.add(player);
+
+    player.on("error", (err) => {
+      onLog?.("voice.player.error", {
+        errorName: err?.name ?? null,
+        errorMessage: err?.message ?? String(err),
+        errorStack: err?.stack ?? null,
+        errorCause:
+          err?.cause instanceof Error
+            ? {
+                name: err.cause.name ?? null,
+                message: err.cause.message ?? null,
+                stack: err.cause.stack ?? null,
+              }
+            : (err?.cause ?? null),
+        errorCode: err?.code ?? null,
+      });
+    });
+
+    player.on("stateChange", (oldState, newState) => {
+      if (oldState.status !== newState.status) {
+        onLog?.("voice.player.state", {
+          from: oldState.status,
+          to: newState.status,
+        });
+      }
+    });
+  }
+
   const state = { connection: null, player };
   voiceStateByGuild.set(guildId, state);
   return state;
@@ -31,8 +65,25 @@ function getOrCreateGuildVoiceState(guildId) {
  * Converts MP3 buffer to PCM stream using FFmpeg.
  * Discord voice works best with raw PCM.
  */
-function mp3BufferToPcmStream(mp3Buffer) {
+function mp3BufferToPcmStream(mp3Buffer, onLog) {
   const input = Readable.from(mp3Buffer);
+
+  input.on("error", (err) => {
+    onLog?.("voice.stream.input.error", {
+      errorName: err?.name ?? null,
+      errorMessage: err?.message ?? String(err),
+      errorStack: err?.stack ?? null,
+      errorCause:
+        err?.cause instanceof Error
+          ? {
+              name: err.cause.name ?? null,
+              message: err.cause.message ?? null,
+              stack: err.cause.stack ?? null,
+            }
+          : (err?.cause ?? null),
+      errorCode: err?.code ?? null,
+    });
+  });
 
   const ffmpeg = new prism.FFmpeg({
     args: [
@@ -51,26 +102,145 @@ function mp3BufferToPcmStream(mp3Buffer) {
     ],
   });
 
-  return input.pipe(ffmpeg);
+  ffmpeg.on("error", (err) => {
+    onLog?.("voice.ffmpeg.error", {
+      errorName: err?.name ?? null,
+      errorMessage: err?.message ?? String(err),
+      errorStack: err?.stack ?? null,
+      errorCause:
+        err?.cause instanceof Error
+          ? {
+              name: err.cause.name ?? null,
+              message: err.cause.message ?? null,
+              stack: err.cause.stack ?? null,
+            }
+          : (err?.cause ?? null),
+      errorCode: err?.code ?? null,
+    });
+  });
+
+  const output = input.pipe(ffmpeg);
+
+  output.on("error", (err) => {
+    onLog?.("voice.stream.output.error", {
+      errorName: err?.name ?? null,
+      errorMessage: err?.message ?? String(err),
+      errorStack: err?.stack ?? null,
+      errorCause:
+        err?.cause instanceof Error
+          ? {
+              name: err.cause.name ?? null,
+              message: err.cause.message ?? null,
+              stack: err.cause.stack ?? null,
+            }
+          : (err?.cause ?? null),
+      errorCode: err?.code ?? null,
+    });
+  });
+
+  return output;
 }
 
-async function ensureConnectionReady(connection) {
-  // If Discord kicks the connection, attempt a quick re-ready.
+function instrumentConnection(connection, onLog, meta) {
+  if (instrumentedConnections.has(connection)) return;
+  instrumentedConnections.add(connection);
+
+  connection.on("error", (err) => {
+    onLog?.("voice.connection.error", {
+      ...meta,
+      errorName: err?.name ?? null,
+      errorMessage: err?.message ?? String(err),
+      errorStack: err?.stack ?? null,
+      errorCause:
+        err?.cause instanceof Error
+          ? {
+              name: err.cause.name ?? null,
+              message: err.cause.message ?? null,
+              stack: err.cause.stack ?? null,
+            }
+          : (err?.cause ?? null),
+      errorCode: err?.code ?? null,
+    });
+  });
+
+  connection.on("stateChange", (oldState, newState) => {
+    if (oldState.status !== newState.status) {
+      onLog?.("voice.connection.state", {
+        ...meta,
+        from: oldState.status,
+        to: newState.status,
+      });
+    }
+  });
+
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
     try {
       await Promise.race([
         entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
         entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
       ]);
-      // If we got here, it’s reconnecting automatically.
-    } catch {
+    } catch (err) {
+      onLog?.("voice.connection.disconnected.error", {
+        ...meta,
+        errorName: err?.name ?? null,
+        errorMessage: err?.message ?? String(err),
+        errorStack: err?.stack ?? null,
+        errorCause:
+          err?.cause instanceof Error
+            ? {
+                name: err.cause.name ?? null,
+                message: err.cause.message ?? null,
+                stack: err.cause.stack ?? null,
+              }
+            : (err?.cause ?? null),
+        errorCode: err?.code ?? null,
+        stateStatus: connection.state?.status ?? null,
+      });
+
       try {
         connection.destroy();
-      } catch {}
+      } catch (destroyErr) {
+        onLog?.("voice.connection.destroy.error", {
+          ...meta,
+          errorName: destroyErr?.name ?? null,
+          errorMessage: destroyErr?.message ?? String(destroyErr),
+          errorStack: destroyErr?.stack ?? null,
+        });
+      }
     }
   });
+}
 
-  await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+async function ensureConnectionReady(connection, onLog, meta) {
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+  } catch (err) {
+    onLog?.("voice.connection.ready.error", {
+      ...meta,
+      stateStatus: connection.state?.status ?? null,
+      joinConfig: connection.joinConfig
+        ? {
+            channelId: connection.joinConfig.channelId ?? null,
+            guildId: connection.joinConfig.guildId ?? null,
+            selfDeaf: connection.joinConfig.selfDeaf ?? null,
+            selfMute: connection.joinConfig.selfMute ?? null,
+          }
+        : null,
+      errorName: err?.name ?? null,
+      errorMessage: err?.message ?? String(err),
+      errorStack: err?.stack ?? null,
+      errorCause:
+        err?.cause instanceof Error
+          ? {
+              name: err.cause.name ?? null,
+              message: err.cause.message ?? null,
+              stack: err.cause.stack ?? null,
+            }
+          : (err?.cause ?? null),
+      errorCode: err?.code ?? null,
+    });
+    throw err;
+  }
 }
 
 /**
@@ -88,51 +258,93 @@ export async function playMp3InVoiceChannel({
   if (!mp3Buffer?.length) throw new Error("Missing mp3Buffer.");
 
   const guildId = guild.id;
-  const state = getOrCreateGuildVoiceState(guildId);
+  const channelId = voiceChannel.id;
+  const meta = { guildId, channelId };
 
-  // Create or move connection to the correct voice channel.
-  if (!state.connection || state.connection.joinConfig.channelId !== voiceChannel.id) {
+  const state = getOrCreateGuildVoiceState(guildId, onLog);
+
+  // For debugging: always destroy the prior connection, even if it points
+  // at the same channel. This avoids reusing any poisoned connection state.
+  if (state.connection) {
     try {
-      state.connection?.destroy?.();
-    } catch {}
-
-    state.connection = joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId: guildId,
-      adapterCreator: guild.voiceAdapterCreator,
-      selfDeaf: false,
-      selfMute: false,
-    });
-
-    await ensureConnectionReady(state.connection);
-    state.connection.subscribe(state.player);
-
-    onLog?.("voice.connected", { guildId, channelId: voiceChannel.id });
+      onLog?.("voice.connection.reset", {
+        ...meta,
+        previousChannelId: state.connection.joinConfig?.channelId ?? null,
+        previousStatus: state.connection.state?.status ?? null,
+      });
+      state.connection.destroy();
+    } catch (err) {
+      onLog?.("voice.connection.prior_destroy.error", {
+        ...meta,
+        errorName: err?.name ?? null,
+        errorMessage: err?.message ?? String(err),
+        errorStack: err?.stack ?? null,
+      });
+    } finally {
+      state.connection = null;
+    }
   }
 
-  // Convert MP3 -> PCM stream for Discord playback
-  const pcmStream = mp3BufferToPcmStream(mp3Buffer);
+  state.connection = joinVoiceChannel({
+    channelId: voiceChannel.id,
+    guildId,
+    adapterCreator: guild.voiceAdapterCreator,
+    selfDeaf: false,
+    selfMute: false,
+  });
+
+  instrumentConnection(state.connection, onLog, meta);
+
+  await ensureConnectionReady(state.connection, onLog, meta);
+  state.connection.subscribe(state.player);
+
+  onLog?.("voice.connected", meta);
+
+  const pcmStream = mp3BufferToPcmStream(mp3Buffer, onLog);
 
   const resource = createAudioResource(pcmStream, {
     inputType: StreamType.Raw,
   });
 
-  // Play
-  state.player.play(resource);
+  try {
+    state.player.play(resource);
+  } catch (err) {
+    onLog?.("voice.player.play.error", {
+      ...meta,
+      errorName: err?.name ?? null,
+      errorMessage: err?.message ?? String(err),
+      errorStack: err?.stack ?? null,
+      errorCause:
+        err?.cause instanceof Error
+          ? {
+              name: err.cause.name ?? null,
+              message: err.cause.message ?? null,
+              stack: err.cause.stack ?? null,
+            }
+          : (err?.cause ?? null),
+      errorCode: err?.code ?? null,
+    });
+    throw err;
+  }
 
-  onLog?.("voice.play.start", { guildId, channelId: voiceChannel.id });
+  onLog?.("voice.play.start", meta);
 
-  // Disconnect after idle to avoid “bot camping” in voice
   const idleTimeout = setTimeout(() => {
     try {
       state.connection?.destroy?.();
-    } catch {}
+    } catch (err) {
+      onLog?.("voice.connection.idle_destroy.error", {
+        ...meta,
+        errorName: err?.name ?? null,
+        errorMessage: err?.message ?? String(err),
+        errorStack: err?.stack ?? null,
+      });
+    }
     state.connection = null;
-    onLog?.("voice.disconnected.idle", { guildId, channelId: voiceChannel.id });
+    onLog?.("voice.disconnected.idle", meta);
   }, disconnectAfterMs);
 
   state.player.once(AudioPlayerStatus.Idle, () => {
     clearTimeout(idleTimeout);
-    // (We still disconnect via timeout, because some streams don’t cleanly trigger Idle)
   });
 }
